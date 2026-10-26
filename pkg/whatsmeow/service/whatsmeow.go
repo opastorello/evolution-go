@@ -178,11 +178,12 @@ func (w whatsmeowService) ReconnectClient(instanceId string) error {
 	if client, exists := w.clientPointer[instanceId]; exists {
 		w.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] Disconnecting existing client", instanceId)
 
-		// Desconectar o cliente WebSocket
-		if client.IsConnected() {
-			client.Disconnect()
-			w.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] WebSocket disconnected", instanceId)
-		}
+		// Desconectar SEMPRE: um cliente que parece desconectado pode estar no
+		// meio de um connect. Disconnect() num socket já fechado é inofensivo.
+		// O laço do StartClient antigo percebe que perdeu a instância (ponteiro
+		// trocado) e encerra sozinho, sem depender do killChannel.
+		client.Disconnect()
+		w.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] WebSocket disconnected", instanceId)
 
 		// Remover event handler se existir
 		if mycli, ok := w.myClientPointer[instanceId]; ok {
@@ -572,12 +573,41 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 
 	// Removed auto-reconnect logic to prevent infinite loops
 
+	// Este laço só cuida do PRÓPRIO cliente. Antes ele relia killChannel[id]
+	// do mapa a cada volta: depois de um ReconnectClient (cujo aviso não
+	// bloqueante quase sempre se perdia) o laço antigo passava a escutar o
+	// canal do cliente NOVO, consumia o próximo sinal, apagava o ponteiro do
+	// cliente novo — que seguia conectado, órfão, recebendo mensagens — e a
+	// API passava a responder "desconectado" sem conseguir gerar QR.
+	myKill := w.killChannel[cd.Instance.Id]
 	for {
+		if w.clientPointer[cd.Instance.Id] != client {
+			w.loggerWrapper.GetLogger(cd.Instance.Id).LogWarn("[%s] Client replaced by a newer one — stopping stale client loop", cd.Instance.Id)
+			client.RemoveEventHandler(mycli.eventHandlerID)
+			client.Disconnect()
+			return
+		}
 		select {
-		case <-w.killChannel[cd.Instance.Id]:
+		case _, open := <-myKill:
+			if !open {
+				// Canal fechado = instância removida/limpa: encerra sem reiniciar.
+				w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] Kill channel closed — stopping client", cd.Instance.Id)
+				client.RemoveEventHandler(mycli.eventHandlerID)
+				client.Disconnect()
+				if w.clientPointer[cd.Instance.Id] == client {
+					delete(w.clientPointer, cd.Instance.Id)
+					delete(w.myClientPointer, cd.Instance.Id)
+				}
+				return
+			}
 			w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("Received kill signal for user '%s'", cd.Instance.Id)
 			client.Disconnect()
 
+			if w.clientPointer[cd.Instance.Id] != client {
+				// Outro cliente assumiu enquanto isso: não mexe nos mapas dele.
+				client.RemoveEventHandler(mycli.eventHandlerID)
+				return
+			}
 			delete(w.clientPointer, cd.Instance.Id)
 			delete(w.myClientPointer, cd.Instance.Id)
 
@@ -654,9 +684,12 @@ func schedulePresenceUpdates(mycli *MyClient) {
 			randomInterval := time.Duration(1+rand.Intn(3)) * time.Hour
 			ticker = time.NewTicker(randomInterval)
 
-		case <-mycli.killChannel[mycli.userID]:
-			mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Received kill signal, stopping presence updates", mycli.userID)
-			return // Encerra a goroutine quando receber sinal de kill
+		}
+		// Não escuta o killChannel: ele é do laço do StartClient, e consumir o
+		// sinal aqui impedia o cliente de ser encerrado.
+		if mycli.clientPointer[mycli.userID] != mycli.WAClient {
+			mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Client replaced, stopping presence updates", mycli.userID)
+			return
 		}
 	}
 }
@@ -848,6 +881,11 @@ func (mycli *MyClient) teardownQR(reason string, forceLogout bool) {
 	// maps (it is the single writer for this instance). Blocking send mirrors
 	// the original timeout branch so the signal is never dropped.
 	mycli.loggerWrapper.GetLogger(instanceID).LogWarn("[%s] QR timeout — signaling kill channel", instanceID)
+	if mycli.clientPointer[instanceID] != mycli.WAClient {
+		// Cliente órfão: não derruba o cliente atual da instância.
+		mycli.WAClient.Disconnect()
+		return
+	}
 	if killChan, exists := mycli.killChannel[instanceID]; exists {
 		killChan <- true
 	}
@@ -1896,8 +1934,15 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 			}
 		}
 
-		// Agora mata o canal DEPOIS de enviar o evento
-		mycli.killChannel[mycli.userID] <- true
+		// Agora mata o canal DEPOIS de enviar o evento — só se este cliente
+		// ainda for o dono da instância (um órfão não derruba o atual).
+		if mycli.clientPointer[mycli.userID] == mycli.WAClient {
+			if killChan, exists := mycli.killChannel[mycli.userID]; exists {
+				killChan <- true
+			}
+		} else {
+			mycli.WAClient.Disconnect()
+		}
 	case *events.ChatPresence:
 		doWebhook = true
 		postMap["event"] = "ChatPresence"
@@ -1967,6 +2012,11 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 			mycli.loggerWrapper.GetLogger(mycli.userID).LogError("[%s] Error updating instance: %s", mycli.Instance.Id, err)
 		}
 	case *events.Disconnected:
+		// Cliente órfão caiu: ignora (não derruba nem reinicia o cliente atual).
+		if mycli.clientPointer[mycli.userID] != mycli.WAClient {
+			mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Stale client disconnected — ignoring", mycli.userID)
+			return
+		}
 		doWebhook = true
 		postMap["event"] = "Disconnected"
 

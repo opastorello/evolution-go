@@ -12,6 +12,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/evolution-foundation/evolution-go/pkg/config"
@@ -241,6 +242,21 @@ func (i instances) Connect(data *ConnectStruct, instance *instance_model.Instanc
 		return nil, "", "", err
 	}
 
+	// Cliente existe mas o socket caiu (estado travado): "já está rodando"
+	// deixaria a instância sem QR e sem conexão para sempre. Faz a reconexão
+	// completa — com sessão válida volta conectado; sem sessão, gera QR.
+	// Trava de 30s: o manager/CheckHouse chamam /connect a cada poucos segundos
+	// enquanto o QR está na tela, e um cliente recém-iniciado também aparece
+	// como "não conectado" por 1–2s — sem a trava, cada chamada o reiniciaria.
+	if existing := i.clientPointer[instance.Id]; existing != nil && !existing.IsConnected() && !recentlyRestarted(instance.Id) {
+		markRestarted(instance.Id)
+		i.loggerWrapper.GetLogger(instance.Id).LogWarn("[%s] Client exists but socket is down — full reconnect", instance.Id)
+		if err := i.whatsmeowService.ReconnectClient(instance.Id); err != nil {
+			return nil, "", "", err
+		}
+		return instance, instance.Jid, eventString, nil
+	}
+
 	// Verifica se a instância já está rodando
 	isInstanceRunning := i.clientPointer[instance.Id] != nil
 
@@ -280,6 +296,7 @@ func (i instances) Connect(data *ConnectStruct, instance *instance_model.Instanc
 			}
 		}
 
+		markRestarted(instance.Id)
 		go i.whatsmeowService.StartClient(clientData)
 	} else {
 		i.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Instance already running, settings updated without restarting client", instance.Id)
@@ -299,12 +316,22 @@ func (i instances) Connect(data *ConnectStruct, instance *instance_model.Instanc
 	return instance, instance.Jid, eventString, nil
 }
 
-func (i instances) Reconnect(instance *instance_model.Instance) error {
-	_, err := i.ensureClientConnected(instance.Id)
-	if err != nil {
-		return err
-	}
+// Último (re)início de cliente por instância, para não reiniciar um cliente
+// que ainda está conectando.
+var restartedAt sync.Map
 
+func markRestarted(instanceID string) { restartedAt.Store(instanceID, time.Now()) }
+
+func recentlyRestarted(instanceID string) bool {
+	v, ok := restartedAt.Load(instanceID)
+	return ok && time.Since(v.(time.Time)) < 30*time.Second
+}
+
+func (i instances) Reconnect(instance *instance_model.Instance) error {
+	markRestarted(instance.Id)
+	// Sem ensureClientConnected: ele recusava justamente o caso que mais
+	// precisa de reconexão (cliente existe mas o socket caiu — "client
+	// disconnected"). ReconnectClient limpa tudo e sobe um cliente novo.
 	return i.whatsmeowService.ReconnectClient(instance.Id)
 }
 
